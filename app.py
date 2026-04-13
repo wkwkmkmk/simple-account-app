@@ -43,17 +43,20 @@ REPORTERS = ["夫", "妻"]
 # データベース接続
 # ---------------------------------------------------------------------------
 
+def _get_secret(key: str, default: str = "") -> str:
+    """Secrets から値を取得する。secrets.toml が存在しない場合は default を返す。"""
+    try:
+        return st.secrets[key]
+    except Exception:
+        return default
+
+
 def _connect():
     """
     Secrets の優先順位: SQLite Cloud → Turso → ローカル SQLite
     """
-    try:
-        secrets = st.secrets
-    except Exception:
-        secrets = {}
-
     # ── SQLite Cloud ────────────────────────────────────────────────────────
-    url = secrets.get("SQLITECLOUD_URL", "") if secrets else ""
+    url = _get_secret("SQLITECLOUD_URL")
     if url:
         try:
             import sqlitecloud
@@ -62,9 +65,9 @@ def _connect():
             st.error("sqlitecloud パッケージが見つかりません。requirements.txt を確認してください。")
             st.stop()
 
-    # ── Turso (libsql-experimental) ─────────────────────────────────────────
-    turso_url   = secrets.get("TURSO_URL",   "") if secrets else ""
-    turso_token = secrets.get("TURSO_TOKEN", "") if secrets else ""
+    # ── Turso ───────────────────────────────────────────────────────────────
+    turso_url   = _get_secret("TURSO_URL")
+    turso_token = _get_secret("TURSO_TOKEN")
     if turso_url and turso_token:
         try:
             import libsql
@@ -111,7 +114,7 @@ def _init_schema(conn) -> None:
             created_at   TEXT    DEFAULT (datetime('now','localtime'))
         )
     """)
-    # デフォルト管理者アカウント（初回のみ作成。パスワード: admin123）
+
     conn.execute(
         "INSERT OR IGNORE INTO users (username, password_hash, is_admin) VALUES (?,?,1)",
         ("admin", _hash("admin123")),
@@ -413,7 +416,7 @@ def page_history() -> None:
            FROM expenses
            WHERE strftime('%Y', expense_date) = ?
              AND strftime('%m', expense_date) = ?
-           ORDER BY expense_date, created_at""",
+           ORDER BY expense_date DESC, created_at DESC""",
         db,
         params=(str(year), f"{month:02d}"),
     )
