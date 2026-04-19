@@ -454,7 +454,7 @@ def page_analysis() -> None:
         st.info("まだ申告データがありません。支出を登録すると分析できるようになります。")
         return
 
-    tab_now, tab_future = st.tabs(["🔍 現状診断", "🔮 将来ビュー"])
+    tab_now, tab_future = st.tabs(["🔍 現状診断", "🧭 将来ビュー"])
 
     with tab_now:
         _render_current_analysis(df_all)
@@ -698,7 +698,7 @@ def _render_future_analysis(df_all: pd.DataFrame) -> None:
     projection = var_projection + fix_projection
 
     # ── 月末着地予測 ──────────────────────────────────────────────────────
-    st.subheader("🔮 今月の月末着地予測")
+    st.subheader("🎯 今月の月末着地予測")
     st.caption(
         f"本日 {today.strftime('%Y-%m-%d')} ／ "
         f"{this_m}月は {days_in_month} 日（経過 {elapsed_days} 日）"
@@ -723,30 +723,64 @@ def _render_future_analysis(df_all: pd.DataFrame) -> None:
 
     st.divider()
 
-    # ── 月次支出と移動平均 ─────────────────────────────────────────────────
-    st.subheader("📈 月次支出と移動平均")
-    monthly_all = df_all.groupby("year_month")["amount"].sum().sort_index()
-    ma = pd.DataFrame({
-        "月次合計":       monthly_all,
-        "3ヶ月移動平均": monthly_all.rolling(3).mean(),
-        "6ヶ月移動平均": monthly_all.rolling(6).mean(),
-    }).reset_index().rename(columns={"year_month": "年月"})
-    ma_long = ma.melt(id_vars="年月", var_name="系列", value_name="金額").dropna()
+    # ── 支出トレンドと移動平均（日/週/月 切替） ─────────────────────────────
+    st.subheader("📈 支出トレンドと移動平均")
 
-    chart_ma = alt.Chart(ma_long).mark_line(point=True).encode(
-        x=alt.X("年月:O", axis=alt.Axis(labelAngle=-45)),
-        y=alt.Y("金額:Q", title="円"),
-        color=alt.Color(
-            "系列:N",
-            scale=alt.Scale(
-                domain=["月次合計", "3ヶ月移動平均", "6ヶ月移動平均"],
-                range=["#94a3b8", "#2563eb", "#059669"],
+    gran = st.segmented_control(
+        "粒度",
+        options=["日別", "週別", "月別"],
+        default="月別",
+        key="ma_granularity",
+    ) or "月別"
+
+    # 日次に resample（欠損日は 0 埋め）
+    daily_sum = (df_all.set_index("expense_date")["amount"]
+                 .resample("D").sum().fillna(0))
+
+    if gran == "日別":
+        series = daily_sum
+        short_window, long_window = 7, 30
+        base_label, short_label, long_label = "日次支出", "7日移動平均", "30日移動平均"
+        show_point = False
+    elif gran == "週別":
+        series = daily_sum.resample("W-MON", label="left").sum()
+        short_window, long_window = 4, 12
+        base_label, short_label, long_label = "週次合計", "4週移動平均", "12週移動平均"
+        show_point = True
+    else:  # 月別
+        series = daily_sum.resample("MS").sum()
+        short_window, long_window = 3, 6
+        base_label, short_label, long_label = "月次合計", "3ヶ月移動平均", "6ヶ月移動平均"
+        show_point = True
+
+    ma_df = pd.DataFrame({
+        base_label:  series,
+        short_label: series.rolling(short_window).mean(),
+        long_label:  series.rolling(long_window).mean(),
+    }).reset_index().rename(columns={"expense_date": "日付", "index": "日付"})
+    ma_long = ma_df.melt(id_vars="日付", var_name="系列", value_name="金額").dropna()
+
+    if ma_long.empty:
+        st.info("この粒度で表示できるデータがありません。")
+    else:
+        chart_ma = alt.Chart(ma_long).mark_line(point=show_point).encode(
+            x=alt.X("日付:T", title=""),
+            y=alt.Y("金額:Q", title="円"),
+            color=alt.Color(
+                "系列:N",
+                scale=alt.Scale(
+                    domain=[base_label, short_label, long_label],
+                    range=["#94a3b8", "#2563eb", "#059669"],
+                ),
             ),
-        ),
-        tooltip=["年月", "系列", alt.Tooltip("金額:Q", format=",")],
+            tooltip=[alt.Tooltip("日付:T", title="日付"), "系列",
+                     alt.Tooltip("金額:Q", format=",")],
+        )
+        st.altair_chart(chart_ma, use_container_width=True)
+    st.caption(
+        "単発のブレを除いた支出水準を確認できます。"
+        "日別＝直近の傾向、週別＝中期、月別＝中長期トレンドの把握に向きます。"
     )
-    st.altair_chart(chart_ma, use_container_width=True)
-    st.caption("単月のブレを除いた、生活コストの基準水準を把握するための指標です。")
 
     st.divider()
 
