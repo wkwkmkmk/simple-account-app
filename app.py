@@ -9,8 +9,10 @@
 import io
 import sqlite3
 import hashlib
+from calendar import monthrange
 from datetime import date, datetime
 
+import altair as alt
 import pandas as pd
 import streamlit as st
 
@@ -38,6 +40,31 @@ CATEGORIES = [
 ]
 
 REPORTERS = ["夫", "妻"]
+
+# 費目の区分（固定費 / 変動費 / 特別費）
+#   固定費 : 月次で概ね一定額が発生
+#   変動費 : 日々の生活で発生、コントロール余地あり
+#   特別費 : 非経常的、年に数回
+CATEGORY_TYPE: dict[str, str] = {
+    "食費":       "変動費",
+    "日用品費":   "変動費",
+    "交通費":     "変動費",
+    "雑費":       "変動費",
+    "美容費":     "変動費",
+    "趣味費":     "変動費",
+    "交際費":     "変動費",
+    "被服費":     "変動費",
+    "医療費":     "変動費",
+    "教育費":     "変動費",
+    "水道光熱費": "固定費",
+    "通信費":     "固定費",
+    "住居費":     "固定費",
+    "保険料":     "固定費",
+    "特別費":     "特別費",
+}
+
+# 日本の二人以上世帯のエンゲル係数目安（総務省 家計調査 概数）
+ENGEL_BENCHMARK = 27.0
 
 # ---------------------------------------------------------------------------
 # データベース接続
@@ -389,6 +416,483 @@ def page_aggregation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 分析ページ
+# ---------------------------------------------------------------------------
+
+def _load_all_expenses(db) -> pd.DataFrame:
+    """全支出を取得し、分析で使う派生カラムを付加して返す。"""
+    df = pd.read_sql_query(
+        "SELECT expense_date, reporter, category, description, amount FROM expenses",
+        db,
+    )
+    if df.empty:
+        return df
+    df["expense_date"] = pd.to_datetime(df["expense_date"])
+    df["year"]       = df["expense_date"].dt.year
+    df["month"]      = df["expense_date"].dt.month
+    df["year_month"] = df["expense_date"].dt.strftime("%Y-%m")
+    df["type"]       = df["category"].map(CATEGORY_TYPE).fillna("変動費")
+    return df
+
+
+def _prev_year_month(ym: str) -> str:
+    """'YYYY-MM' の前月を返す。"""
+    y, m = map(int, ym.split("-"))
+    m -= 1
+    if m <= 0:
+        m += 12
+        y -= 1
+    return f"{y}-{m:02d}"
+
+
+def page_analysis() -> None:
+    st.header("📈 分析")
+    db = get_db()
+    df_all = _load_all_expenses(db)
+
+    if df_all.empty:
+        st.info("まだ申告データがありません。支出を登録すると分析できるようになります。")
+        return
+
+    tab_now, tab_future = st.tabs(["🔍 現状診断", "🔮 将来ビュー"])
+
+    with tab_now:
+        _render_current_analysis(df_all)
+    with tab_future:
+        _render_future_analysis(df_all)
+
+
+# --- 現状診断タブ ----------------------------------------------------------
+
+def _render_current_analysis(df_all: pd.DataFrame) -> None:
+    months_available = sorted(df_all["year_month"].unique())
+
+    # 既定は直近12ヶ月
+    default_start_idx = max(0, len(months_available) - 12)
+    c1, c2 = st.columns(2)
+    with c1:
+        start_ym = st.selectbox(
+            "開始月", months_available,
+            index=default_start_idx, key="ana_start",
+        )
+    with c2:
+        end_ym = st.selectbox(
+            "終了月", months_available,
+            index=len(months_available) - 1, key="ana_end",
+        )
+    if start_ym > end_ym:
+        st.error("開始月は終了月以前にしてください。")
+        return
+
+    mask = (df_all["year_month"] >= start_ym) & (df_all["year_month"] <= end_ym)
+    df = df_all.loc[mask].copy()
+    period_months = [m for m in months_available if start_ym <= m <= end_ym]
+
+    if df.empty:
+        st.info("選択期間にデータがありません。")
+        return
+
+    # ── 期間サマリ（月平均） ────────────────────────────────────────────────
+    monthly       = df.groupby("year_month")["amount"].sum()
+    food_monthly  = df[df["category"] == "食費"].groupby("year_month")["amount"].sum()
+    fixed_monthly = df[df["type"] == "固定費"].groupby("year_month")["amount"].sum()
+    engel_series  = (food_monthly.reindex(period_months, fill_value=0)
+                     / monthly.reindex(period_months).replace(0, pd.NA) * 100)
+    fixed_ratio   = (fixed_monthly.reindex(period_months, fill_value=0)
+                     / monthly.reindex(period_months).replace(0, pd.NA) * 100)
+
+    st.subheader("📌 期間サマリ（月平均）")
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("月平均支出", f"¥{int(monthly.mean()):,}")
+    m2.metric(
+        "平均エンゲル係数",
+        f"{engel_series.mean():.1f}%" if engel_series.notna().any() else "—",
+        help=f"食費÷総支出。日本の二人以上世帯の目安 約{ENGEL_BENCHMARK}%",
+    )
+    m3.metric(
+        "平均固定費率",
+        f"{fixed_ratio.mean():.1f}%" if fixed_ratio.notna().any() else "—",
+        help="住居・通信・水道光熱・保険を固定費として算出",
+    )
+    m4.metric("データ件数", f"{len(df):,} 件")
+
+    st.divider()
+
+    # ── エンゲル係数の推移 ─────────────────────────────────────────────────
+    st.subheader("🍚 エンゲル係数の推移")
+    engel_df = (engel_series.reset_index()
+                .rename(columns={"year_month": "年月", 0: "エンゲル係数(%)"}))
+    engel_df.columns = ["年月", "エンゲル係数(%)"]
+    engel_df["日本平均目安"] = ENGEL_BENCHMARK
+
+    line = alt.Chart(engel_df).mark_line(point=True, color="#d97706").encode(
+        x=alt.X("年月:O", sort=period_months, axis=alt.Axis(labelAngle=-45)),
+        y=alt.Y("エンゲル係数(%):Q"),
+        tooltip=["年月", alt.Tooltip("エンゲル係数(%):Q", format=".1f")],
+    )
+    bench = alt.Chart(engel_df).mark_rule(
+        color="#64748b", strokeDash=[4, 4]
+    ).encode(y="日本平均目安:Q")
+    st.altair_chart(line + bench, use_container_width=True)
+    st.caption(f"点線は総務省家計調査の目安（{ENGEL_BENCHMARK}% 前後）。外食比率が高いと自然に上がる点に注意。")
+
+    st.divider()
+
+    # ── 費目構成比の推移（100%積み上げ面） ─────────────────────────────────
+    st.subheader("🧩 費目構成比の推移")
+    cat_month = (df.groupby(["year_month", "category"])["amount"].sum()
+                   .reset_index())
+    stack = alt.Chart(cat_month).mark_area().encode(
+        x=alt.X("year_month:O", title="年月",
+                sort=period_months, axis=alt.Axis(labelAngle=-45)),
+        y=alt.Y("amount:Q", stack="normalize",
+                axis=alt.Axis(format=".0%"), title="構成比"),
+        color=alt.Color("category:N", title="費目"),
+        tooltip=["year_month", "category",
+                 alt.Tooltip("amount:Q", format=",", title="金額")],
+    )
+    st.altair_chart(stack, use_container_width=True)
+
+    st.divider()
+
+    # ── 固定費 / 変動費 / 特別費 ──────────────────────────────────────────
+    st.subheader("🏛️ 固定費 / 変動費 / 特別費")
+    type_month = (df.groupby(["year_month", "type"])["amount"].sum()
+                    .reset_index())
+    bar = alt.Chart(type_month).mark_bar().encode(
+        x=alt.X("year_month:O", title="年月",
+                sort=period_months, axis=alt.Axis(labelAngle=-45)),
+        y=alt.Y("amount:Q", title="金額（円）"),
+        color=alt.Color(
+            "type:N", title="区分",
+            scale=alt.Scale(
+                domain=["固定費", "変動費", "特別費"],
+                range=["#2563eb", "#10b981", "#ef4444"],
+            ),
+        ),
+        tooltip=["year_month", "type",
+                 alt.Tooltip("amount:Q", format=",", title="金額")],
+    )
+    st.altair_chart(bar, use_container_width=True)
+
+    st.divider()
+
+    # ── 夫婦間バランス ────────────────────────────────────────────────────
+    st.subheader("👫 夫婦間バランス（費目別）")
+    rep_cat = (df.groupby(["category", "reporter"])["amount"].sum()
+                 .unstack(fill_value=0))
+    for col in ["夫", "妻"]:
+        if col not in rep_cat.columns:
+            rep_cat[col] = 0
+    rep_cat["合計"] = rep_cat["夫"] + rep_cat["妻"]
+    rep_cat = rep_cat.sort_values("合計", ascending=False)
+    rep_long = rep_cat[["夫", "妻"]].reset_index().melt(
+        id_vars="category", var_name="申告者", value_name="金額"
+    )
+    balance = alt.Chart(rep_long).mark_bar().encode(
+        y=alt.Y("category:N", sort=rep_cat.index.tolist(), title="費目"),
+        x=alt.X("金額:Q", stack="normalize",
+                axis=alt.Axis(format=".0%"), title="構成比"),
+        color=alt.Color(
+            "申告者:N",
+            scale=alt.Scale(domain=["夫", "妻"], range=["#3b82f6", "#ec4899"]),
+        ),
+        tooltip=["category", "申告者",
+                 alt.Tooltip("金額:Q", format=",")],
+    )
+    st.altair_chart(balance, use_container_width=True)
+
+    st.divider()
+
+    # ── 日別ヒートマップ ──────────────────────────────────────────────────
+    st.subheader("📅 日別支出ヒートマップ")
+    daily = df.groupby("expense_date")["amount"].sum().reset_index()
+    iso = daily["expense_date"].dt.isocalendar()
+    daily["iso_year"] = iso.year.astype(int)
+    daily["iso_week"] = iso.week.astype(int)
+    daily["year_week"] = (
+        daily["iso_year"].astype(str) + "-W" + daily["iso_week"].astype(str).str.zfill(2)
+    )
+    weekday_ja = {0: "月", 1: "火", 2: "水", 3: "木", 4: "金", 5: "土", 6: "日"}
+    daily["曜日"] = daily["expense_date"].dt.weekday.map(weekday_ja)
+
+    heat = alt.Chart(daily).mark_rect().encode(
+        x=alt.X("year_week:O", title="週", axis=alt.Axis(labelAngle=-45)),
+        y=alt.Y("曜日:O", sort=["月", "火", "水", "木", "金", "土", "日"]),
+        color=alt.Color("amount:Q", title="支出",
+                        scale=alt.Scale(scheme="reds")),
+        tooltip=[alt.Tooltip("expense_date:T", title="日付"), "曜日",
+                 alt.Tooltip("amount:Q", format=",", title="支出")],
+    )
+    st.altair_chart(heat, use_container_width=True)
+
+    st.divider()
+
+    # ── 前月比・前年同月比 ────────────────────────────────────────────────
+    st.subheader("📊 前月比・前年同月比")
+    all_monthly = df_all.groupby("year_month")["amount"].sum()
+    latest_ym = end_ym
+    latest_amt = int(all_monthly.get(latest_ym, 0))
+
+    prev_ym = _prev_year_month(latest_ym)
+    prev_amt = int(all_monthly.loc[prev_ym]) if prev_ym in all_monthly.index else None
+
+    y, m = map(int, latest_ym.split("-"))
+    py_ym = f"{y - 1}-{m:02d}"
+    py_amt = int(all_monthly.loc[py_ym]) if py_ym in all_monthly.index else None
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric(f"{latest_ym} 合計", f"¥{latest_amt:,}")
+    if prev_amt is not None and prev_amt > 0:
+        d = latest_amt - prev_amt
+        c2.metric("前月比", f"¥{d:+,}",
+                  delta=f"{(d / prev_amt * 100):+.1f}%", delta_color="inverse")
+    else:
+        c2.metric("前月比", "—")
+    if py_amt is not None and py_amt > 0:
+        d = latest_amt - py_amt
+        c3.metric("前年同月比", f"¥{d:+,}",
+                  delta=f"{(d / py_amt * 100):+.1f}%", delta_color="inverse")
+    else:
+        c3.metric("前年同月比", "—")
+    st.caption("※ 支出は少ないほど良いので、増加を赤・減少を緑で表示しています。")
+
+
+# --- 将来ビュータブ --------------------------------------------------------
+
+def _render_future_analysis(df_all: pd.DataFrame) -> None:
+    today = date.today()
+    this_y, this_m = today.year, today.month
+    this_ym = f"{this_y}-{this_m:02d}"
+    days_in_month = monthrange(this_y, this_m)[1]
+    elapsed_days = max(1, min(today.day, days_in_month))
+
+    # ── 今月データと過去3ヶ月 ────────────────────────────────────────────
+    df_this = df_all[df_all["year_month"] == this_ym]
+    df_var = df_this[df_this["type"] == "変動費"]
+    df_fix = df_this[df_this["type"].isin(["固定費", "特別費"])]
+
+    var_so_far = int(df_var["amount"].sum())
+    fix_so_far = int(df_fix["amount"].sum())
+    total_so_far = var_so_far + fix_so_far
+
+    past_ym = []
+    for i in range(1, 4):
+        y, m = this_y, this_m - i
+        while m <= 0:
+            y -= 1
+            m += 12
+        past_ym.append(f"{y}-{m:02d}")
+    past_df = df_all[df_all["year_month"].isin(past_ym)]
+
+    past_fix_avg_series = (past_df[past_df["type"].isin(["固定費", "特別費"])]
+                           .groupby("year_month")["amount"].sum())
+    past_fix_avg = int(past_fix_avg_series.mean()) if not past_fix_avg_series.empty else 0
+
+    past_total_series = past_df.groupby("year_month")["amount"].sum()
+    past_total_avg = int(past_total_series.mean()) if not past_total_series.empty else 0
+
+    # 予測: 変動費は日割り延長、固定費は max(実績, 過去平均)
+    var_projection = int(var_so_far * days_in_month / elapsed_days)
+    fix_projection = max(fix_so_far, past_fix_avg)
+    projection = var_projection + fix_projection
+
+    # ── 月末着地予測 ──────────────────────────────────────────────────────
+    st.subheader("🔮 今月の月末着地予測")
+    st.caption(
+        f"本日 {today.strftime('%Y-%m-%d')} ／ "
+        f"{this_m}月は {days_in_month} 日（経過 {elapsed_days} 日）"
+    )
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("現時点の支出", f"¥{total_so_far:,}")
+    delta_str = (
+        f"{projection - past_total_avg:+,}円 vs 過去3ヶ月平均"
+        if past_total_avg else None
+    )
+    m2.metric("月末予測", f"¥{projection:,}", delta=delta_str, delta_color="inverse")
+    m3.metric("　うち変動費（日割り）", f"¥{var_projection:,}",
+              help="現時点の変動費実績を経過日数で割り、月末日数まで延長")
+    m4.metric("　うち固定費（実績/平均）", f"¥{fix_projection:,}",
+              help="当月実績と過去3ヶ月平均の大きい方を採用")
+
+    st.caption(
+        "変動費：当月実績 × (月の日数 / 経過日数) で延長。"
+        "固定費・特別費：まだ未計上のものがある前提で、過去3ヶ月平均を下限にします。"
+    )
+
+    st.divider()
+
+    # ── 月次支出と移動平均 ─────────────────────────────────────────────────
+    st.subheader("📈 月次支出と移動平均")
+    monthly_all = df_all.groupby("year_month")["amount"].sum().sort_index()
+    ma = pd.DataFrame({
+        "月次合計":       monthly_all,
+        "3ヶ月移動平均": monthly_all.rolling(3).mean(),
+        "6ヶ月移動平均": monthly_all.rolling(6).mean(),
+    }).reset_index().rename(columns={"year_month": "年月"})
+    ma_long = ma.melt(id_vars="年月", var_name="系列", value_name="金額").dropna()
+
+    chart_ma = alt.Chart(ma_long).mark_line(point=True).encode(
+        x=alt.X("年月:O", axis=alt.Axis(labelAngle=-45)),
+        y=alt.Y("金額:Q", title="円"),
+        color=alt.Color(
+            "系列:N",
+            scale=alt.Scale(
+                domain=["月次合計", "3ヶ月移動平均", "6ヶ月移動平均"],
+                range=["#94a3b8", "#2563eb", "#059669"],
+            ),
+        ),
+        tooltip=["年月", "系列", alt.Tooltip("金額:Q", format=",")],
+    )
+    st.altair_chart(chart_ma, use_container_width=True)
+    st.caption("単月のブレを除いた、生活コストの基準水準を把握するための指標です。")
+
+    st.divider()
+
+    # ── 年間実績と年末予測 ────────────────────────────────────────────────
+    st.subheader("🗓️ 年間実績と年末予測")
+    this_year_df = df_all[df_all["year"] == this_y]
+    year_monthly = (this_year_df.groupby("month")["amount"].sum()
+                    .reindex(range(1, 13), fill_value=0))
+
+    ytd_actual = int(year_monthly.loc[:this_m - 1].sum()) if this_m > 1 else 0
+
+    # 残月予測の基準: 直近12ヶ月（当月除く）の平均
+    last_12 = (df_all[df_all["year_month"] != this_ym]
+               .groupby("year_month")["amount"].sum()
+               .sort_index().tail(12))
+    monthly_avg_12 = int(last_12.mean()) if not last_12.empty else 0
+
+    remaining_months = max(0, 12 - this_m)
+    future_part = projection + monthly_avg_12 * remaining_months
+    year_projection = ytd_actual + future_part
+
+    y1, y2, y3 = st.columns(3)
+    y1.metric(f"{this_y}年 1月〜{this_m - 1 if this_m > 1 else 0}月 実績",
+              f"¥{ytd_actual:,}")
+    y2.metric("今月予測+残月(平均)", f"¥{future_part:,}")
+    y3.metric("年末着地予測", f"¥{year_projection:,}")
+
+    year_chart_df = pd.DataFrame({
+        "月":          [f"{m:02d}月" for m in range(1, 13)],
+        "実績":        [int(year_monthly.loc[m]) if m < this_m else 0 for m in range(1, 13)],
+        "当月予測":    [projection if m == this_m else 0 for m in range(1, 13)],
+        "予測（平均）": [monthly_avg_12 if m > this_m else 0 for m in range(1, 13)],
+    })
+    year_long = year_chart_df.melt(id_vars="月", var_name="区分", value_name="金額")
+    year_long = year_long[year_long["金額"] > 0]
+
+    if not year_long.empty:
+        year_chart = alt.Chart(year_long).mark_bar().encode(
+            x=alt.X("月:N", sort=[f"{m:02d}月" for m in range(1, 13)]),
+            y=alt.Y("金額:Q", title="円"),
+            color=alt.Color(
+                "区分:N",
+                scale=alt.Scale(
+                    domain=["実績", "当月予測", "予測（平均）"],
+                    range=["#10b981", "#f59e0b", "#94a3b8"],
+                ),
+            ),
+            tooltip=["月", "区分", alt.Tooltip("金額:Q", format=",")],
+        )
+        st.altair_chart(year_chart, use_container_width=True)
+
+    st.caption(
+        "残月は「直近12ヶ月（当月除く）の月平均」を流用した簡易予測です。"
+        "ボーナス月・年末の特別費などは考慮しない点に注意。"
+    )
+
+    st.divider()
+
+    # ── 気づきコメント ────────────────────────────────────────────────────
+    st.subheader("💡 気づきコメント")
+    notes = _generate_insights(df_all, this_ym, past_ym, projection, past_total_avg)
+    if notes:
+        for level, msg in notes:
+            if level == "warn":
+                st.warning(msg)
+            elif level == "good":
+                st.success(msg)
+            else:
+                st.info(msg)
+    else:
+        st.info("現時点では特筆すべき変化は見当たりません。")
+
+
+def _generate_insights(
+    df_all: pd.DataFrame,
+    this_ym: str,
+    past_ym: list[str],
+    projection: int,
+    past_total_avg: int,
+) -> list[tuple[str, str]]:
+    """ルールベースで家計の気づきを生成する。"""
+    notes: list[tuple[str, str]] = []
+
+    # 1) 月末予測の乖離
+    if past_total_avg:
+        diff_ratio = (projection - past_total_avg) / past_total_avg
+        if diff_ratio >= 0.15:
+            notes.append(("warn",
+                f"今月の月末予測 ¥{projection:,} は過去3ヶ月平均 "
+                f"¥{past_total_avg:,} より {diff_ratio * 100:.0f}% 多い見込みです。"))
+        elif diff_ratio <= -0.15:
+            notes.append(("good",
+                f"今月の月末予測 ¥{projection:,} は過去3ヶ月平均 "
+                f"¥{past_total_avg:,} より {abs(diff_ratio) * 100:.0f}% 少ない見込みです。"))
+
+    # 2) 費目別の急増
+    df_this = df_all[df_all["year_month"] == this_ym]
+    df_past = df_all[df_all["year_month"].isin(past_ym)]
+    if not df_past.empty and not df_this.empty:
+        this_by_cat = df_this.groupby("category")["amount"].sum()
+        n_past_months = df_past["year_month"].nunique()
+        past_by_cat = df_past.groupby("category")["amount"].sum() / max(n_past_months, 1)
+        for cat in this_by_cat.index:
+            past_val = float(past_by_cat.get(cat, 0))
+            this_val = float(this_by_cat[cat])
+            if past_val >= 3000:  # 小さすぎる費目はノイズになるので除外
+                r = (this_val - past_val) / past_val
+                if r >= 0.30:
+                    notes.append(("warn",
+                        f"「{cat}」が過去3ヶ月平均（¥{int(past_val):,}）から "
+                        f"{r * 100:.0f}% 増えています。"))
+
+    # 3) 直近3ヶ月の連続トレンド
+    monthly_all = df_all.groupby("year_month")["amount"].sum().sort_index()
+    if len(monthly_all) >= 4:
+        last4 = monthly_all.tail(4).values
+        diffs = [last4[i + 1] - last4[i] for i in range(3)]
+        if all(d > 0 for d in diffs):
+            notes.append(("info", "月次支出が3ヶ月連続で増加しています。"))
+        elif all(d < 0 for d in diffs):
+            notes.append(("good", "月次支出が3ヶ月連続で減少しています 👏"))
+
+    # 4) エンゲル係数の急変
+    food_monthly = (df_all[df_all["category"] == "食費"]
+                    .groupby("year_month")["amount"].sum())
+    if len(monthly_all) >= 4:
+        engel = (food_monthly.reindex(monthly_all.index, fill_value=0)
+                 / monthly_all.replace(0, pd.NA) * 100).dropna()
+        if len(engel) >= 4 and engel.index[-1] == this_ym:
+            this_engel = engel.iloc[-1]
+            past_engel = engel.iloc[-4:-1].mean()
+            if past_engel > 0:
+                diff = this_engel - past_engel
+                if diff >= 5:
+                    notes.append(("info",
+                        f"エンゲル係数が直近3ヶ月平均 {past_engel:.1f}% から "
+                        f"{this_engel:.1f}% に上昇しています。"))
+                elif diff <= -5:
+                    notes.append(("info",
+                        f"エンゲル係数が直近3ヶ月平均 {past_engel:.1f}% から "
+                        f"{this_engel:.1f}% に低下しています。"))
+
+    return notes
+
+
+# ---------------------------------------------------------------------------
 # 申告履歴ページ（編集・削除）
 # ---------------------------------------------------------------------------
 
@@ -686,6 +1190,7 @@ def main() -> None:
             "💰 支出申告":   "expense",
             "📋 履歴・編集": "history",
             "📊 集計":       "aggregation",
+            "📈 分析":       "analysis",
         }
         if user["is_admin"]:
             menu["👥 ユーザー管理"] = "users"
@@ -705,6 +1210,8 @@ def main() -> None:
         page_history()
     elif page_key == "aggregation":
         page_aggregation()
+    elif page_key == "analysis":
+        page_analysis()
     elif page_key == "users":
         page_user_management()
 
