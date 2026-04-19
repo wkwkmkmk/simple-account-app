@@ -780,6 +780,119 @@ def _month_end_projection(
     }
 
 
+# --- 年末着地予測（季節性 + 信頼区間） ------------------------------------
+
+def _year_end_projection(
+    df_all: pd.DataFrame,
+    this_ym: str,
+    month_pred: dict,
+) -> dict:
+    """
+    年末着地予測を、季節性を反映した平均と 80% 信頼区間で返す。
+
+    モデル:
+      - YTD: 当月より前の月の実績合計（確定・分散0）
+      - 当月: 月末予測の中央値と分散をそのまま利用
+      - 残月: 各カレンダー月について
+          * 過去同月の実績があれば、その平均と分散を使用
+            （同月サンプル数 n が少ないほど直近12ヶ月平均に寄せる）
+          * 無ければ直近12ヶ月平均（分散は月次合計の分散）
+      - 合算: 独立仮定で平均・分散を加算。80% CI = 中央値 ± 1.282σ
+    """
+    this_y, this_m = map(int, this_ym.split("-"))
+
+    # YTD 実績（当月より前）
+    this_year_df = df_all[df_all["year"] == this_y]
+    ytd_actual = int(this_year_df[this_year_df["month"] < this_m]["amount"].sum())
+
+    # 過去月（当月除く）の月次合計
+    monthly_past = (df_all[df_all["year_month"] != this_ym]
+                    .groupby("year_month")["amount"].sum().sort_index())
+
+    # 直近12ヶ月統計（フォールバック）
+    recent_12 = monthly_past.tail(12)
+    if not recent_12.empty:
+        recent_mean = float(recent_12.mean())
+        recent_var  = (float(recent_12.var(ddof=0)) if len(recent_12) > 1
+                       else (recent_mean * 0.15) ** 2)
+    else:
+        recent_mean = 0.0
+        recent_var  = 0.0
+
+    # カレンダー月別（季節性）
+    season_stats: dict[int, dict] = {}
+    if not monthly_past.empty:
+        mp = pd.DataFrame({
+            "year_month": monthly_past.index,
+            "amount":     monthly_past.values,
+        })
+        mp["cal_month"] = mp["year_month"].str.split("-").str[1].astype(int)
+        for m in range(1, 13):
+            vals = mp.loc[mp["cal_month"] == m, "amount"].values
+            if len(vals) > 0:
+                season_stats[m] = {
+                    "mean": float(vals.mean()),
+                    "var":  (float(vals.var(ddof=0)) if len(vals) > 1 else recent_var),
+                    "n":    int(len(vals)),
+                }
+
+    # 残月の推定
+    future_mean = 0.0
+    future_var  = 0.0
+    breakdown: list[dict] = []
+    for m in range(this_m + 1, 13):
+        if m in season_stats:
+            s = season_stats[m]
+            # n サンプルを季節値として、残りは直近平均にシュリンク
+            w = s["n"] / (s["n"] + 1.0)
+            mu  = w * s["mean"] + (1 - w) * recent_mean
+            var = s["var"]
+            source = f"同月過去 {s['n']} 回"
+        else:
+            mu  = recent_mean
+            var = recent_var
+            source = "直近12ヶ月平均"
+        future_mean += mu
+        future_var  += var
+        sd = math.sqrt(var) if var > 0 else 0.0
+        breakdown.append({
+            "month":  m,
+            "mean":   int(mu),
+            "sd":     int(sd),
+            "ci_low":  max(0, int(mu - 1.282 * sd)) if sd > 0 else None,
+            "ci_high": int(mu + 1.282 * sd) if sd > 0 else None,
+            "source": source,
+        })
+
+    # 当月予測（月末予測モデルから）
+    curr_mean = float(month_pred["mean"])
+    curr_var  = float(month_pred["sd"]) ** 2
+
+    total_mean = ytd_actual + curr_mean + future_mean
+    total_var  = curr_var + future_var
+    total_sd   = math.sqrt(total_var) if total_var > 0 else 0.0
+
+    z80 = 1.282
+    ci_low  = max(0.0, total_mean - z80 * total_sd)
+    ci_high = total_mean + z80 * total_sd
+
+    return {
+        "ytd_actual":      ytd_actual,
+        "current_mean":    int(curr_mean),
+        "current_sd":      int(math.sqrt(curr_var)) if curr_var > 0 else 0,
+        "current_ci_low":  month_pred.get("ci_low", int(curr_mean)),
+        "current_ci_high": month_pred.get("ci_high", int(curr_mean)),
+        "future_mean":     int(future_mean),
+        "total_mean":      int(total_mean),
+        "total_sd":        int(total_sd),
+        "ci_low":          int(ci_low),
+        "ci_high":         int(ci_high),
+        "has_seasonality": any(m in season_stats for m in range(this_m + 1, 13)),
+        "breakdown":       breakdown,
+        "season_stats":    season_stats,
+    }
+
+
 # --- 将来ビュータブ --------------------------------------------------------
 
 def _render_future_analysis(df_all: pd.DataFrame) -> None:
@@ -966,58 +1079,129 @@ def _render_future_analysis(df_all: pd.DataFrame) -> None:
 
     st.divider()
 
-    # ── 年間実績と年末予測 ────────────────────────────────────────────────
+    # ── 年間実績と年末予測（季節性 + 信頼区間） ───────────────────────────
     st.subheader("🗓️ 年間実績と年末予測")
+    yproj = _year_end_projection(df_all, this_ym, pred)
     this_year_df = df_all[df_all["year"] == this_y]
     year_monthly = (this_year_df.groupby("month")["amount"].sum()
                     .reindex(range(1, 13), fill_value=0))
 
-    ytd_actual = int(year_monthly.loc[:this_m - 1].sum()) if this_m > 1 else 0
-
-    # 残月予測の基準: 直近12ヶ月（当月除く）の平均
-    last_12 = (df_all[df_all["year_month"] != this_ym]
-               .groupby("year_month")["amount"].sum()
-               .sort_index().tail(12))
-    monthly_avg_12 = int(last_12.mean()) if not last_12.empty else 0
-
-    remaining_months = max(0, 12 - this_m)
-    future_part = projection + monthly_avg_12 * remaining_months
-    year_projection = ytd_actual + future_part
-
     y1, y2, y3 = st.columns(3)
-    y1.metric(f"{this_y}年 1月〜{this_m - 1 if this_m > 1 else 0}月 実績",
-              f"¥{ytd_actual:,}")
-    y2.metric("今月予測+残月(平均)", f"¥{future_part:,}")
-    y3.metric("年末着地予測", f"¥{year_projection:,}")
-
-    year_chart_df = pd.DataFrame({
-        "月":          [f"{m:02d}月" for m in range(1, 13)],
-        "実績":        [int(year_monthly.loc[m]) if m < this_m else 0 for m in range(1, 13)],
-        "当月予測":    [projection if m == this_m else 0 for m in range(1, 13)],
-        "予測（平均）": [monthly_avg_12 if m > this_m else 0 for m in range(1, 13)],
-    })
-    year_long = year_chart_df.melt(id_vars="月", var_name="区分", value_name="金額")
-    year_long = year_long[year_long["金額"] > 0]
-
-    if not year_long.empty:
-        year_chart = alt.Chart(year_long).mark_bar().encode(
-            x=alt.X("月:N", sort=[f"{m:02d}月" for m in range(1, 13)]),
-            y=alt.Y("金額:Q", title="円"),
-            color=alt.Color(
-                "区分:N",
-                scale=alt.Scale(
-                    domain=["実績", "当月予測", "予測（平均）"],
-                    range=["#10b981", "#f59e0b", "#94a3b8"],
-                ),
-            ),
-            tooltip=["月", "区分", alt.Tooltip("金額:Q", format=",")],
-        )
-        st.altair_chart(year_chart, use_container_width=True)
-
-    st.caption(
-        "残月は「直近12ヶ月（当月除く）の月平均」を流用した簡易予測です。"
-        "ボーナス月・年末の特別費などは考慮しない点に注意。"
+    y1.metric(
+        f"{this_y}年 1〜{this_m - 1 if this_m > 1 else 0}月 実績",
+        f"¥{yproj['ytd_actual']:,}",
     )
+    y2.metric(
+        "年末着地予測（中央値）", f"¥{yproj['total_mean']:,}",
+        help="YTD実績 + 今月予測 + 残月の季節値合計",
+    )
+    if yproj["total_sd"] > 0:
+        y3.metric(
+            "80% 信頼区間",
+            f"¥{yproj['ci_low']:,} 〜 ¥{yproj['ci_high']:,}",
+            help=(f"当月の月末予測分散 + 残月の分散を合成 "
+                  f"（σ=¥{yproj['total_sd']:,}）"),
+        )
+    else:
+        y3.metric("80% 信頼区間", "—",
+                  help="履歴データが不足しているため幅を計算できません。")
+
+    # 月別棒グラフ（実績・今月予測・将来予測）＋ 信頼区間ひげ
+    month_labels = [f"{m:02d}月" for m in range(1, 13)]
+    rows = []
+    for m in range(1, 13):
+        if m < this_m:
+            rows.append({
+                "月": f"{m:02d}月", "区分": "実績",
+                "mean": int(year_monthly.loc[m]),
+                "low": None, "high": None, "source": "確定",
+            })
+        elif m == this_m:
+            rows.append({
+                "月": f"{m:02d}月", "区分": "今月予測",
+                "mean": pred["mean"],
+                "low":  pred["ci_low"]  if pred["sd"] > 0 else None,
+                "high": pred["ci_high"] if pred["sd"] > 0 else None,
+                "source": "月末予測モデル",
+            })
+        else:
+            bd = next((b for b in yproj["breakdown"] if b["month"] == m), None)
+            if bd:
+                rows.append({
+                    "月": f"{m:02d}月", "区分": "将来予測",
+                    "mean": bd["mean"],
+                    "low":  bd["ci_low"], "high": bd["ci_high"],
+                    "source": bd["source"],
+                })
+    chart_df = pd.DataFrame(rows)
+
+    bar = alt.Chart(chart_df).mark_bar().encode(
+        x=alt.X("月:N", sort=month_labels, title=""),
+        y=alt.Y("mean:Q", title="円"),
+        color=alt.Color(
+            "区分:N",
+            scale=alt.Scale(
+                domain=["実績", "今月予測", "将来予測"],
+                range=["#10b981", "#f59e0b", "#94a3b8"],
+            ),
+        ),
+        tooltip=[
+            "月", "区分",
+            alt.Tooltip("mean:Q", title="中央値", format=","),
+            alt.Tooltip("source:N", title="根拠"),
+        ],
+    )
+
+    whisker_df = chart_df.dropna(subset=["low", "high"])
+    if not whisker_df.empty:
+        whisker = alt.Chart(whisker_df).mark_rule(
+            color="#475569", strokeWidth=2,
+        ).encode(
+            x=alt.X("月:N", sort=month_labels),
+            y="low:Q", y2="high:Q",
+            tooltip=[
+                "月",
+                alt.Tooltip("low:Q",  title="80% 下限", format=","),
+                alt.Tooltip("high:Q", title="80% 上限", format=","),
+            ],
+        )
+        cap_top = alt.Chart(whisker_df).mark_tick(
+            color="#475569", size=14, thickness=2,
+        ).encode(x=alt.X("月:N", sort=month_labels), y="high:Q")
+        cap_bot = alt.Chart(whisker_df).mark_tick(
+            color="#475569", size=14, thickness=2,
+        ).encode(x=alt.X("月:N", sort=month_labels), y="low:Q")
+        st.altair_chart(bar + whisker + cap_top + cap_bot,
+                        use_container_width=True)
+    else:
+        st.altair_chart(bar, use_container_width=True)
+
+    season_note = (
+        "過去同月の実績を季節値として使用（サンプル数で直近12ヶ月平均にシュリンク）"
+        if yproj["has_seasonality"]
+        else "季節データが不足しているため、残月は直近12ヶ月平均を使用"
+    )
+    st.caption(
+        f"残月の予測：{season_note}。ひげは 80% 信頼区間です。"
+        "残月が多いほどCI幅が累積で広がります。"
+    )
+
+    with st.expander("📐 残月ごとの予測根拠"):
+        if yproj["breakdown"]:
+            bd_df = pd.DataFrame(yproj["breakdown"])
+            bd_df["月"] = bd_df["month"].map(lambda m: f"{m:02d}月")
+            bd_df["予測"] = bd_df["mean"].map(lambda v: f"¥{v:,}")
+            bd_df["80% 下限"] = bd_df["ci_low"].map(
+                lambda v: f"¥{v:,}" if pd.notna(v) else "—")
+            bd_df["80% 上限"] = bd_df["ci_high"].map(
+                lambda v: f"¥{v:,}" if pd.notna(v) else "—")
+            bd_df["根拠"] = bd_df["source"]
+            st.dataframe(
+                bd_df[["月", "予測", "80% 下限", "80% 上限", "根拠"]],
+                use_container_width=True, hide_index=True,
+            )
+        else:
+            st.info("残月はありません。")
 
     st.divider()
 
