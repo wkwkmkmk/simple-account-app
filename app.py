@@ -7,6 +7,7 @@
   - 設定がなければローカルの SQLite ファイル（household_expenses.db）を使用
 """
 import io
+import math
 import sqlite3
 import hashlib
 from calendar import monthrange
@@ -658,6 +659,127 @@ def _render_current_analysis(df_all: pd.DataFrame) -> None:
     st.caption("※ 支出は少ないほど良いので、増加を赤・減少を緑で表示しています。")
 
 
+# --- 月末着地予測（曜日補正 + 信頼区間） ----------------------------------
+
+def _month_end_projection(
+    df_all: pd.DataFrame,
+    this_ym: str,
+    days_in_month: int,
+    elapsed_days: int,
+    lookback_days: int = 90,
+) -> dict:
+    """
+    曜日補正 + 正規近似の信頼区間付きで月末着地を予測する。
+
+    モデル:
+      - 変動費: 過去 lookback_days 日の「曜日別 日次支出」の平均/分散を推定。
+                残日それぞれについて、その曜日の平均を加算し、分散も加算する。
+      - 固定費・特別費: 過去 lookback_days 日に含まれる月の月次合計から平均/分散を推定。
+                        当月実績が過去平均を上回っていれば実績を採用（分散0）。
+                        下回っていれば過去平均を中央値・過去分散を揺らぎとして採用。
+      - 合算: 独立と仮定して平均・分散を加算。80% 信頼区間は 中央値 ± 1.282σ。
+    """
+    this_y, this_m = map(int, this_ym.split("-"))
+
+    df_this = df_all[df_all["year_month"] == this_ym]
+    var_so_far = int(df_this[df_this["type"] == "変動費"]["amount"].sum())
+    fix_so_far = int(df_this[df_this["type"].isin(["固定費", "特別費"])]["amount"].sum())
+
+    # ── 履歴（当月より前の lookback_days 日） ────────────────────────────
+    cutoff = pd.Timestamp(this_y, this_m, 1)
+    hist_start = cutoff - pd.Timedelta(days=lookback_days)
+    hist = df_all[(df_all["expense_date"] >= hist_start) & (df_all["expense_date"] < cutoff)]
+
+    # ── 曜日別 日次変動費 ────────────────────────────────────────────────
+    var_hist = hist[hist["type"] == "変動費"]
+    dow_stats = None
+    if not var_hist.empty:
+        full_range = pd.date_range(hist_start, cutoff - pd.Timedelta(days=1))
+        daily = (var_hist.groupby("expense_date")["amount"].sum()
+                 .reindex(full_range, fill_value=0))
+        dow_df = pd.DataFrame({"amount": daily.values, "dow": daily.index.weekday})
+        dow_stats = (dow_df.groupby("dow")["amount"]
+                     .agg(["mean", "var", "count"])
+                     .reindex(range(7)).fillna(0))
+
+    # ── 残日 ─────────────────────────────────────────────────────────────
+    if elapsed_days < days_in_month:
+        remaining_dates = pd.date_range(
+            pd.Timestamp(this_y, this_m, elapsed_days + 1),
+            pd.Timestamp(this_y, this_m, days_in_month),
+        )
+    else:
+        remaining_dates = pd.DatetimeIndex([])
+
+    # ── 変動費: 残期間の平均・分散 ──────────────────────────────────────
+    if dow_stats is not None and len(remaining_dates) > 0 and dow_stats["count"].sum() > 0:
+        rem_mean = float(sum(dow_stats.loc[d.weekday(), "mean"] for d in remaining_dates))
+        rem_var  = float(sum(dow_stats.loc[d.weekday(), "var"]  for d in remaining_dates))
+    else:
+        # フォールバック: 当月実績の日割り（分散は推定不可 → 0）
+        daily_avg = (var_so_far / elapsed_days) if elapsed_days > 0 else 0.0
+        rem_mean = daily_avg * len(remaining_dates)
+        rem_var = 0.0
+
+    var_mean_total = var_so_far + rem_mean
+    var_var_total  = rem_var
+
+    # ── 固定費・特別費: 過去月次合計から推定 ────────────────────────────
+    fix_hist = hist[hist["type"].isin(["固定費", "特別費"])]
+    fix_monthly = fix_hist.groupby("year_month")["amount"].sum()
+    if not fix_monthly.empty:
+        past_fix_mean = float(fix_monthly.mean())
+        past_fix_var  = float(fix_monthly.var(ddof=0)) if len(fix_monthly) > 1 else 0.0
+    else:
+        past_fix_mean = 0.0
+        past_fix_var  = 0.0
+
+    if fix_so_far >= past_fix_mean:
+        fix_mean_total = float(fix_so_far)
+        fix_var_total  = 0.0
+    else:
+        fix_mean_total = past_fix_mean
+        fix_var_total  = past_fix_var
+
+    # ── 合算 ─────────────────────────────────────────────────────────────
+    mean_total = var_mean_total + fix_mean_total
+    var_total  = var_var_total  + fix_var_total
+    sd_total   = math.sqrt(var_total) if var_total > 0 else 0.0
+
+    z80 = 1.282  # 正規近似の 80% 両側
+    ci_low  = max(0.0, mean_total - z80 * sd_total)
+    ci_high = mean_total + z80 * sd_total
+
+    # 過去3ヶ月の総支出平均（delta 表示・気づきに使用）
+    past_ym_list = []
+    for i in range(1, 4):
+        y, m = this_y, this_m - i
+        while m <= 0:
+            y -= 1
+            m += 12
+        past_ym_list.append(f"{y}-{m:02d}")
+    past_total = (df_all[df_all["year_month"].isin(past_ym_list)]
+                  .groupby("year_month")["amount"].sum())
+    past_total_avg = int(past_total.mean()) if not past_total.empty else 0
+
+    return {
+        "var_so_far":    var_so_far,
+        "fix_so_far":    fix_so_far,
+        "total_so_far":  var_so_far + fix_so_far,
+        "var_mean":      int(var_mean_total),
+        "fix_mean":      int(fix_mean_total),
+        "mean":          int(mean_total),
+        "sd":            int(sd_total),
+        "ci_low":        int(ci_low),
+        "ci_high":       int(ci_high),
+        "has_dow_model": dow_stats is not None and dow_stats["count"].sum() > 0,
+        "dow_stats":     dow_stats,
+        "remaining_days": int(len(remaining_dates)),
+        "past_total_avg": past_total_avg,
+        "past_ym_list":  past_ym_list,
+    }
+
+
 # --- 将来ビュータブ --------------------------------------------------------
 
 def _render_future_analysis(df_all: pd.DataFrame) -> None:
@@ -667,59 +789,119 @@ def _render_future_analysis(df_all: pd.DataFrame) -> None:
     days_in_month = monthrange(this_y, this_m)[1]
     elapsed_days = max(1, min(today.day, days_in_month))
 
-    # ── 今月データと過去3ヶ月 ────────────────────────────────────────────
-    df_this = df_all[df_all["year_month"] == this_ym]
-    df_var = df_this[df_this["type"] == "変動費"]
-    df_fix = df_this[df_this["type"].isin(["固定費", "特別費"])]
-
-    var_so_far = int(df_var["amount"].sum())
-    fix_so_far = int(df_fix["amount"].sum())
-    total_so_far = var_so_far + fix_so_far
-
-    past_ym = []
-    for i in range(1, 4):
-        y, m = this_y, this_m - i
-        while m <= 0:
-            y -= 1
-            m += 12
-        past_ym.append(f"{y}-{m:02d}")
-    past_df = df_all[df_all["year_month"].isin(past_ym)]
-
-    past_fix_avg_series = (past_df[past_df["type"].isin(["固定費", "特別費"])]
-                           .groupby("year_month")["amount"].sum())
-    past_fix_avg = int(past_fix_avg_series.mean()) if not past_fix_avg_series.empty else 0
-
-    past_total_series = past_df.groupby("year_month")["amount"].sum()
-    past_total_avg = int(past_total_series.mean()) if not past_total_series.empty else 0
-
-    # 予測: 変動費は日割り延長、固定費は max(実績, 過去平均)
-    var_projection = int(var_so_far * days_in_month / elapsed_days)
-    fix_projection = max(fix_so_far, past_fix_avg)
-    projection = var_projection + fix_projection
+    pred = _month_end_projection(df_all, this_ym, days_in_month, elapsed_days)
+    past_ym        = pred["past_ym_list"]
+    past_total_avg = pred["past_total_avg"]
+    projection     = pred["mean"]  # 下流（年間予測・気づき）に中央値を渡す
 
     # ── 月末着地予測 ──────────────────────────────────────────────────────
     st.subheader("🎯 今月の月末着地予測")
     st.caption(
         f"本日 {today.strftime('%Y-%m-%d')} ／ "
-        f"{this_m}月は {days_in_month} 日（経過 {elapsed_days} 日）"
+        f"{this_m}月は {days_in_month} 日（経過 {elapsed_days} 日・残り "
+        f"{pred['remaining_days']} 日）"
     )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("現時点の支出", f"¥{total_so_far:,}")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("現時点の支出", f"¥{pred['total_so_far']:,}")
     delta_str = (
-        f"{projection - past_total_avg:+,}円 vs 過去3ヶ月平均"
+        f"{pred['mean'] - past_total_avg:+,}円 vs 過去3ヶ月平均"
         if past_total_avg else None
     )
-    m2.metric("月末予測", f"¥{projection:,}", delta=delta_str, delta_color="inverse")
-    m3.metric("　うち変動費（日割り）", f"¥{var_projection:,}",
-              help="現時点の変動費実績を経過日数で割り、月末日数まで延長")
-    m4.metric("　うち固定費（実績/平均）", f"¥{fix_projection:,}",
-              help="当月実績と過去3ヶ月平均の大きい方を採用")
+    c2.metric("月末予測（中央値）", f"¥{pred['mean']:,}",
+              delta=delta_str, delta_color="inverse")
+    if pred["sd"] > 0:
+        c3.metric(
+            "80% 信頼区間",
+            f"¥{pred['ci_low']:,} 〜 ¥{pred['ci_high']:,}",
+            help=f"正規近似で 中央値 ±1.282σ（σ = ¥{pred['sd']:,}）",
+        )
+    else:
+        c3.metric("80% 信頼区間", "—",
+                  help="履歴データが不足しているため幅を計算できません。")
 
-    st.caption(
-        "変動費：当月実績 × (月の日数 / 経過日数) で延長。"
-        "固定費・特別費：まだ未計上のものがある前提で、過去3ヶ月平均を下限にします。"
-    )
+    # 予測幅の可視化
+    if pred["sd"] > 0 or past_total_avg:
+        band_df = pd.DataFrame({
+            "ラベル": ["月末予測"],
+            "下限":   [pred["ci_low"]],
+            "上限":   [pred["ci_high"]],
+            "中央値": [pred["mean"]],
+            "過去平均": [past_total_avg],
+        })
+        layers = []
+        if pred["sd"] > 0:
+            layers.append(
+                alt.Chart(band_df).mark_bar(
+                    color="#93c5fd", opacity=0.55, size=24,
+                ).encode(
+                    x=alt.X("下限:Q", title="円",
+                            axis=alt.Axis(format=",.0f")),
+                    x2="上限:Q",
+                    y=alt.Y("ラベル:N", title=""),
+                    tooltip=[alt.Tooltip("下限:Q", format=","),
+                             alt.Tooltip("上限:Q", format=",")],
+                )
+            )
+        layers.append(
+            alt.Chart(band_df).mark_point(
+                size=220, filled=True, color="#1d4ed8",
+            ).encode(
+                x="中央値:Q", y="ラベル:N",
+                tooltip=[alt.Tooltip("中央値:Q", format=",")],
+            )
+        )
+        if past_total_avg:
+            layers.append(
+                alt.Chart(band_df).mark_rule(
+                    color="#ef4444", strokeDash=[4, 4], size=2,
+                ).encode(
+                    x="過去平均:Q",
+                    tooltip=[alt.Tooltip("過去平均:Q", title="過去3ヶ月平均",
+                                         format=",")],
+                )
+            )
+        st.altair_chart(alt.layer(*layers).properties(height=90),
+                        use_container_width=True)
+        st.caption("青点＝中央値、青帯＝80% 信頼区間、赤破線＝過去3ヶ月平均。")
+
+    # 内訳と仮定
+    with st.expander("📐 予測の内訳と仮定"):
+        b1, b2 = st.columns(2)
+        b1.metric("　うち変動費（曜日補正）", f"¥{pred['var_mean']:,}",
+                  help="過去90日の曜日別日次支出平均 × 残日数 + 当月既実績")
+        b2.metric("　うち固定費・特別費", f"¥{pred['fix_mean']:,}",
+                  help="過去3ヶ月の月次合計平均と当月実績の大きい方")
+        st.caption(
+            "**変動費**：過去90日の曜日別日次支出の平均・分散を使い、"
+            "残日の曜日ごとに期待額を積み上げます（週末偏重に自動で追従）。"
+            "　**固定費・特別費**：過去3ヶ月の月次合計の平均・分散を使用。"
+            "　**信頼区間**：日次ぶんの分散と月次ぶんの分散を加算して正規近似。"
+            "日々の支出は独立と仮定しているため、信頼区間は目安としてお使いください。"
+        )
+
+    # 曜日プロファイル
+    if pred["has_dow_model"]:
+        with st.expander("📅 曜日別 日次変動費プロファイル（過去90日）"):
+            name_map = {0: "月", 1: "火", 2: "水", 3: "木", 4: "金", 5: "土", 6: "日"}
+            dow_df = pred["dow_stats"].reset_index()
+            dow_df["曜日"] = dow_df["dow"].map(name_map)
+            dow_df["標準偏差"] = dow_df["var"].apply(
+                lambda v: math.sqrt(v) if v > 0 else 0
+            )
+            dow_chart = alt.Chart(dow_df).mark_bar().encode(
+                x=alt.X("曜日:N",
+                        sort=["月", "火", "水", "木", "金", "土", "日"]),
+                y=alt.Y("mean:Q", title="平均日次支出（円）"),
+                color=alt.Color("曜日:N", legend=None),
+                tooltip=[
+                    "曜日",
+                    alt.Tooltip("mean:Q", title="平均", format=",.0f"),
+                    alt.Tooltip("標準偏差:Q", title="標準偏差", format=",.0f"),
+                    alt.Tooltip("count:Q", title="観測日数", format=".0f"),
+                ],
+            )
+            st.altair_chart(dow_chart, use_container_width=True)
 
     st.divider()
 
