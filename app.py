@@ -156,45 +156,13 @@ def _init_schema(conn) -> None:
         conn.execute("ALTER TABLE users ADD COLUMN reporter TEXT NOT NULL DEFAULT ''")
         conn.commit()
 
-    # マイグレーション: expenses.amount から CHECK(amount > 0) 制約を撤廃
-    # （返金・返品をマイナス金額として登録できるようにするため）
-    # 検出は DDL 文字列ではなく、実際にマイナスを INSERT して弾かれるかで判定する
-    needs_amount_migration = False
-    try:
-        conn.execute(
-            "INSERT INTO expenses (expense_date, reporter, description, category, amount)"
-            " VALUES ('1900-01-01', '__migration_probe__', '', '__probe__', -1)"
-        )
-        # 通った＝制約なし。プローブ行を消す。
-        conn.execute("DELETE FROM expenses WHERE reporter='__migration_probe__'")
-        conn.commit()
-    except Exception:
-        # CHECK で弾かれた＝旧スキーマ
-        try: conn.rollback()
-        except Exception: pass
-        needs_amount_migration = True
-
-    if needs_amount_migration:
-        conn.execute("""
-            CREATE TABLE expenses_new (
-                id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                expense_date TEXT    NOT NULL,
-                reporter     TEXT    NOT NULL,
-                description  TEXT    NOT NULL,
-                category     TEXT    NOT NULL,
-                amount       INTEGER NOT NULL,
-                created_at   TEXT    DEFAULT (datetime('now','localtime'))
-            )
-        """)
-        conn.execute(
-            "INSERT INTO expenses_new"
-            " (id, expense_date, reporter, description, category, amount, created_at)"
-            " SELECT id, expense_date, reporter, description, category, amount, created_at"
-            " FROM expenses"
-        )
-        conn.execute("DROP TABLE expenses")
-        conn.execute("ALTER TABLE expenses_new RENAME TO expenses")
-        conn.commit()
+    # 注: 既存DBの expenses.amount から CHECK(amount > 0) を外す必要がある場合は、
+    #     アプリ起動時にやらず、SQLite Cloud / Turso のSQLコンソールで手動実行する。
+    #     詳細は README または以下の手順を参照。
+    #       1) CREATE TABLE expenses_new ( ... amount INTEGER NOT NULL ... );
+    #       2) INSERT INTO expenses_new SELECT ... FROM expenses;
+    #       3) DROP TABLE expenses;
+    #       4) ALTER TABLE expenses_new RENAME TO expenses;
 
     _sync(conn)  # Turso の場合: 初期化完了後にリモートへ反映
 
