@@ -138,7 +138,7 @@ def _init_schema(conn) -> None:
             reporter     TEXT    NOT NULL,
             description  TEXT    NOT NULL,
             category     TEXT    NOT NULL,
-            amount       INTEGER NOT NULL CHECK(amount > 0),
+            amount       INTEGER NOT NULL,
             created_at   TEXT    DEFAULT (datetime('now','localtime'))
         )
     """)
@@ -155,6 +155,39 @@ def _init_schema(conn) -> None:
     except Exception:
         conn.execute("ALTER TABLE users ADD COLUMN reporter TEXT NOT NULL DEFAULT ''")
         conn.commit()
+
+    # マイグレーション: expenses.amount から CHECK(amount > 0) 制約を撤廃
+    # （返金・返品をマイナス金額として登録できるようにするため）
+    try:
+        cur = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='expenses'"
+        )
+        row = cur.fetchone()
+        ddl = (row[0] if row else "") or ""
+        if "CHECK" in ddl.upper() and "AMOUNT" in ddl.upper():
+            conn.execute("""
+                CREATE TABLE expenses_new (
+                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                    expense_date TEXT    NOT NULL,
+                    reporter     TEXT    NOT NULL,
+                    description  TEXT    NOT NULL,
+                    category     TEXT    NOT NULL,
+                    amount       INTEGER NOT NULL,
+                    created_at   TEXT    DEFAULT (datetime('now','localtime'))
+                )
+            """)
+            conn.execute(
+                "INSERT INTO expenses_new"
+                " (id, expense_date, reporter, description, category, amount, created_at)"
+                " SELECT id, expense_date, reporter, description, category, amount, created_at"
+                " FROM expenses"
+            )
+            conn.execute("DROP TABLE expenses")
+            conn.execute("ALTER TABLE expenses_new RENAME TO expenses")
+            conn.commit()
+    except Exception:
+        # マイグレーションに失敗しても既存機能は維持する
+        pass
 
     _sync(conn)  # Turso の場合: 初期化完了後にリモートへ反映
 
@@ -263,11 +296,12 @@ def page_expense_entry() -> None:
             )
             amount = st.number_input(
                 "💴 金額（円）",
-                min_value=1,
+                min_value=-10_000_000,
                 max_value=10_000_000,
                 step=100,
                 value=None,
                 placeholder="金額を入力",
+                help="返金・返品はマイナスで入力してください（例: -1500）。0 は登録できません。",
             )
 
         with col_r:
@@ -281,6 +315,8 @@ def page_expense_entry() -> None:
         if st.form_submit_button("✅ 申告する", type="primary", use_container_width=True):
             if amount is None:
                 st.error("金額を入力してください。")
+            elif int(amount) == 0:
+                st.error("金額に 0 は登録できません。返金・返品はマイナスで入力してください。")
             else:
                 db.execute(
                     "INSERT INTO expenses"
@@ -617,11 +653,20 @@ def _render_current_analysis(df_all: pd.DataFrame) -> None:
     weekday_ja = {0: "月", 1: "火", 2: "水", 3: "木", 4: "金", 5: "土", 6: "日"}
     daily["曜日"] = daily["expense_date"].dt.weekday.map(weekday_ja)
 
+    # 返金（マイナス）が含まれる場合は発散カラー、それ以外は従来の reds
+    _has_refund = bool((daily["amount"] < 0).any())
+    if _has_refund:
+        _amax = float(daily["amount"].abs().max() or 1)
+        color_scale = alt.Scale(
+            scheme="redblue", reverse=True, domain=[-_amax, 0, _amax], domainMid=0
+        )
+    else:
+        color_scale = alt.Scale(scheme="reds")
+
     heat = alt.Chart(daily).mark_rect().encode(
         x=alt.X("year_week:O", title="週", axis=alt.Axis(labelAngle=-45)),
         y=alt.Y("曜日:O", sort=["月", "火", "水", "木", "金", "土", "日"]),
-        color=alt.Color("amount:Q", title="支出",
-                        scale=alt.Scale(scheme="reds")),
+        color=alt.Color("amount:Q", title="支出", scale=color_scale),
         tooltip=[alt.Tooltip("expense_date:T", title="日付"), "曜日",
                  alt.Tooltip("amount:Q", format=",", title="支出")],
     )
@@ -1397,7 +1442,8 @@ def page_history() -> None:
                     new_reporter = row["reporter"]
                 new_amount = st.number_input(
                     "💴 金額（円）", value=int(row["amount"]),
-                    min_value=1, max_value=10_000_000, step=100,
+                    min_value=-10_000_000, max_value=10_000_000, step=100,
+                    help="返金・返品はマイナスで入力してください（例: -1500）。0 は登録できません。",
                 )
             with fcol_r:
                 new_category    = st.selectbox("🏷️ 費目", CATEGORIES, index=cat_idx)
@@ -1408,20 +1454,23 @@ def page_history() -> None:
                 )
 
             if st.form_submit_button("💾 保存する", type="primary", use_container_width=True):
-                db.execute(
-                    "UPDATE expenses"
-                    " SET expense_date=?, reporter=?, description=?, category=?, amount=?"
-                    " WHERE id=?",
-                    (
-                        str(new_date), new_reporter or row["reporter"],
-                        new_description.strip() if new_description else "",
-                        new_category, int(new_amount), selected_id,
-                    ),
-                )
-                db.commit()
-                _sync(db)
-                st.success("✅ 更新しました。")
-                st.rerun()
+                if int(new_amount) == 0:
+                    st.error("金額に 0 は登録できません。返金・返品はマイナスで入力してください。")
+                else:
+                    db.execute(
+                        "UPDATE expenses"
+                        " SET expense_date=?, reporter=?, description=?, category=?, amount=?"
+                        " WHERE id=?",
+                        (
+                            str(new_date), new_reporter or row["reporter"],
+                            new_description.strip() if new_description else "",
+                            new_category, int(new_amount), selected_id,
+                        ),
+                    )
+                    db.commit()
+                    _sync(db)
+                    st.success("✅ 更新しました。")
+                    st.rerun()
 
     # ── 削除（二段階確認） ───────────────────────────────────────────────────
     with col_del:
