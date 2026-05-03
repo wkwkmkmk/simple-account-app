@@ -158,36 +158,43 @@ def _init_schema(conn) -> None:
 
     # マイグレーション: expenses.amount から CHECK(amount > 0) 制約を撤廃
     # （返金・返品をマイナス金額として登録できるようにするため）
+    # 検出は DDL 文字列ではなく、実際にマイナスを INSERT して弾かれるかで判定する
+    needs_amount_migration = False
     try:
-        cur = conn.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='expenses'"
+        conn.execute(
+            "INSERT INTO expenses (expense_date, reporter, description, category, amount)"
+            " VALUES ('1900-01-01', '__migration_probe__', '', '__probe__', -1)"
         )
-        row = cur.fetchone()
-        ddl = (row[0] if row else "") or ""
-        if "CHECK" in ddl.upper() and "AMOUNT" in ddl.upper():
-            conn.execute("""
-                CREATE TABLE expenses_new (
-                    id           INTEGER PRIMARY KEY AUTOINCREMENT,
-                    expense_date TEXT    NOT NULL,
-                    reporter     TEXT    NOT NULL,
-                    description  TEXT    NOT NULL,
-                    category     TEXT    NOT NULL,
-                    amount       INTEGER NOT NULL,
-                    created_at   TEXT    DEFAULT (datetime('now','localtime'))
-                )
-            """)
-            conn.execute(
-                "INSERT INTO expenses_new"
-                " (id, expense_date, reporter, description, category, amount, created_at)"
-                " SELECT id, expense_date, reporter, description, category, amount, created_at"
-                " FROM expenses"
-            )
-            conn.execute("DROP TABLE expenses")
-            conn.execute("ALTER TABLE expenses_new RENAME TO expenses")
-            conn.commit()
+        # 通った＝制約なし。プローブ行を消す。
+        conn.execute("DELETE FROM expenses WHERE reporter='__migration_probe__'")
+        conn.commit()
     except Exception:
-        # マイグレーションに失敗しても既存機能は維持する
-        pass
+        # CHECK で弾かれた＝旧スキーマ
+        try: conn.rollback()
+        except Exception: pass
+        needs_amount_migration = True
+
+    if needs_amount_migration:
+        conn.execute("""
+            CREATE TABLE expenses_new (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                expense_date TEXT    NOT NULL,
+                reporter     TEXT    NOT NULL,
+                description  TEXT    NOT NULL,
+                category     TEXT    NOT NULL,
+                amount       INTEGER NOT NULL,
+                created_at   TEXT    DEFAULT (datetime('now','localtime'))
+            )
+        """)
+        conn.execute(
+            "INSERT INTO expenses_new"
+            " (id, expense_date, reporter, description, category, amount, created_at)"
+            " SELECT id, expense_date, reporter, description, category, amount, created_at"
+            " FROM expenses"
+        )
+        conn.execute("DROP TABLE expenses")
+        conn.execute("ALTER TABLE expenses_new RENAME TO expenses")
+        conn.commit()
 
     _sync(conn)  # Turso の場合: 初期化完了後にリモートへ反映
 
@@ -301,7 +308,6 @@ def page_expense_entry() -> None:
                 step=100,
                 value=None,
                 placeholder="金額を入力",
-                help="返金・返品はマイナスで入力してください（例: -1500）。0 は登録できません。",
             )
 
         with col_r:
@@ -315,8 +321,6 @@ def page_expense_entry() -> None:
         if st.form_submit_button("✅ 申告する", type="primary", use_container_width=True):
             if amount is None:
                 st.error("金額を入力してください。")
-            elif int(amount) == 0:
-                st.error("金額に 0 は登録できません。返金・返品はマイナスで入力してください。")
             else:
                 db.execute(
                     "INSERT INTO expenses"
@@ -1443,7 +1447,6 @@ def page_history() -> None:
                 new_amount = st.number_input(
                     "💴 金額（円）", value=int(row["amount"]),
                     min_value=-10_000_000, max_value=10_000_000, step=100,
-                    help="返金・返品はマイナスで入力してください（例: -1500）。0 は登録できません。",
                 )
             with fcol_r:
                 new_category    = st.selectbox("🏷️ 費目", CATEGORIES, index=cat_idx)
@@ -1454,23 +1457,20 @@ def page_history() -> None:
                 )
 
             if st.form_submit_button("💾 保存する", type="primary", use_container_width=True):
-                if int(new_amount) == 0:
-                    st.error("金額に 0 は登録できません。返金・返品はマイナスで入力してください。")
-                else:
-                    db.execute(
-                        "UPDATE expenses"
-                        " SET expense_date=?, reporter=?, description=?, category=?, amount=?"
-                        " WHERE id=?",
-                        (
-                            str(new_date), new_reporter or row["reporter"],
-                            new_description.strip() if new_description else "",
-                            new_category, int(new_amount), selected_id,
-                        ),
-                    )
-                    db.commit()
-                    _sync(db)
-                    st.success("✅ 更新しました。")
-                    st.rerun()
+                db.execute(
+                    "UPDATE expenses"
+                    " SET expense_date=?, reporter=?, description=?, category=?, amount=?"
+                    " WHERE id=?",
+                    (
+                        str(new_date), new_reporter or row["reporter"],
+                        new_description.strip() if new_description else "",
+                        new_category, int(new_amount), selected_id,
+                    ),
+                )
+                db.commit()
+                _sync(db)
+                st.success("✅ 更新しました。")
+                st.rerun()
 
     # ── 削除（二段階確認） ───────────────────────────────────────────────────
     with col_del:
